@@ -1,16 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-优化版流量生成脚本 (Numpy 向量化加速版)
-速度提升百倍以上，数学逻辑与原版保持绝对一致。
+这个脚本的主要功能是根据地面区域的流量需求和卫星的实时位置，选取最近卫星建立星地链路
+利用重力模型计算卫星之间的流量矩阵。
 """
+import random
 import sys
-import math
-import numpy as np
 import pandas as pd
+from math import radians, sin, cos, sqrt, atan2
 
-# ==========================================
-# 1. 配置常量 (与原版完全一致)
-# ==========================================
+# --- 配置常量 ---
+# 地面区域流量权重矩阵，表示不同地理区域的流量需求强度。
+# 这是一个12x24的矩阵，对应12个纬度区域和24个经度区域。
 OLD_WEIGHT_LIST = [[0, 0, 0, 0, 2, 2, 2, 2, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 0, 0, 0, 0],
                    [5, 17, 19, 2, 2, 2, 2, 2, 1, 1, 1, 1, 4, 9, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5],
                    [1, 17, 0, 19, 19, 19, 19, 19, 2, 0, 0, 46, 178, 76, 16, 6, 6, 6, 5, 6, 72, 5, 5, 1],
@@ -25,144 +25,265 @@ OLD_WEIGHT_LIST = [[0, 0, 0, 0, 2, 2, 2, 2, 1, 1, 1, 0, 1, 1, 0, 1, 1, 1, 1, 1, 
                    [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]]
 
 TOTAL_OLD_WEIGHT_SUM = sum(sum(row) for row in OLD_WEIGHT_LIST)
-WEIGHT_SCALE_FACTOR = 25000 
+# 流量权重缩放因子，根据星座特性调整，目前采用new方式设计
+# Old: 13.2 = 66颗卫星 * 2 (双向) * 0.1 (假设的平均流量), 0.44 是一个调整系数，使得表格均值符合预期
+# New : 66 * 2 * 0.1 * 20 ( 假设的平均流量，链路数<约等于卫星数*2> * 负载强度<0.1> * 链路带宽<20> Mbps)
+WEIGHT_SCALE_FACTOR = 264 # New: 66 * 2 * 0.1 * 20=264      Old: 13.2 * 0.44
 WEIGHT_LIST = [[(element / TOTAL_OLD_WEIGHT_SUM) * WEIGHT_SCALE_FACTOR for element in row] for row in OLD_WEIGHT_LIST]
 
-HOTSPOT_MULTIPLIER = 5.0  
-NUM_LAT_REGIONS = 12    
-NUM_LON_REGIONS = 24    
-LAT_RANGE = (90, -90)   
-LON_RANGE = (-180, 180) 
-EARTH_RADIUS_KM = 6371  
+# 地理区域划分
+NUM_LAT_REGIONS = 12    # 纬度方向的区域数量。
+NUM_LON_REGIONS = 24    # 经度方向的区域数量。
+LAT_RANGE = (90, -90)   # 纬度范围 (北到南)
+LON_RANGE = (-180, 180) # 经度范围 (西到东)
 
-SATELLITE_TRAJECTORY_CSV = '.\\经纬度(Iridium)new.csv' 
-TRAFFIC_MATRIX_CSV = 'traffic_matrix(Iridium).csv'  
+# 仿真时间
+TOTAL_SIM_TIME_STEPS = 1441 # 仿真时间步数 (例如，101表示从时间步1到100)
 
-# ==========================================
-# 2. 向量化运算核心函数 (Numpy 提速引擎)
-# ==========================================
-def create_regions_arrays(weight_matrix, num_lat, num_lon, lat_range, lon_range):
-    """将地理区域转为 Numpy 数组以支持矩阵运算"""
+# 输入/输出文件路径
+SATELLITE_TRAJECTORY_CSV = '.\\经纬度(Iridium).csv' # 包含卫星轨迹数据的CSV文件路径。
+TRAFFIC_MATRIX_CSV = 'traffic_matrix(Iridium).csv'  # 输出流量矩阵的CSV文件路径。
+
+# 地球半径 (公里)
+EARTH_RADIUS_KM = 6371  # 用于Haversine公式计算距离。
+
+# --- 辅助函数 ---
+
+def create_regions(weight_matrix, num_lat, num_lon, lat_range, lon_range):
+    """
+    创建地理区域字典，包含中心经纬度和流量权重。
+
+    Args:
+        weight_matrix (list[list[float]]): 流量权重矩阵。
+        num_lat (int): 纬度区域数量。
+        num_lon (int): 经度区域数量。
+        lat_range (tuple[int, int]): 纬度范围 (北到南)。
+        lon_range (tuple[int, int]): 经度范围 (西到东)。
+
+    Returns:
+        dict: 包含每个地理区域信息的字典，键为 (lat_idx, lon_idx)，值为包含
+              'lat_center', 'lon_center', 'weight' 的字典。
+    """
+    # 计算每个纬度区域和经度区域的跨度。
     lat_span = (lat_range[0] - lat_range[1]) / num_lat
     lon_span = (lon_range[0] - lon_range[1]) / num_lon
-
-    reg_lats, reg_lons, reg_weights = [], [], []
+    
+    regions_dict = {}
+    # 遍历所有纬度区域和经度区域。
     for lat_idx in range(num_lat):
         for lon_idx in range(num_lon):
+            # 计算当前区域的中心纬度。
             lat_center = lat_range[0] - lat_idx * lat_span - lat_span / 2
-            lon_center = lon_range[0] + lon_idx * lon_span + lon_span / 2
-            reg_lats.append(lat_center)
-            reg_lons.append(lon_center)
-            reg_weights.append(weight_matrix[lat_idx][lon_idx])
+            # 计算当前区域的中心经度
+            lon_center = lon_range[0] + lon_idx * lon_span + lon_span / 2 # 经度从-180开始递增
             
-    return np.array(reg_lats), np.array(reg_lons), np.array(reg_weights)
+            # 获取当前区域的流量权重。
+            weight = weight_matrix[lat_idx][lon_idx]
+            # 将区域信息存储到字典中。
+            regions_dict[(lat_idx, lon_idx)] = {
+                'lat_center': lat_center,
+                'lon_center': lon_center,
+                'weight': weight
+            }
+    return regions_dict
 
-def haversine_vectorized(lat1, lon1, lat2, lon2):
+def haversine(lat1, lon1, lat2, lon2):
     """
-    向量化的 Haversine 距离计算 (支持矩阵广播)
-    lat1, lon1 shape: [N, 1]
-    lat2, lon2 shape: [1, M]
-    Returns shape: [N, M] 距离矩阵
+    使用Haversine公式计算两个地理坐标点之间的球面距离（公里）。
+
+    Args:
+        lat1 (float): 第一个点的纬度。
+        lon1 (float): 第一个点的经度。
+        lat2 (float): 第二个点的纬度。
+        lon2 (float): 第二个点的经度。
+
+    Returns:
+        float: 两个点之间的球面距离（公里）。
     """
-    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
-    dlat = lat2 - lat1
+    # 将经纬度从度转换为弧度。
+    lat1, lon1, lat2, lon2 = map(radians, [lat1, lon1, lat2, lon2])
+    
+    # 计算经度和纬度差。
     dlon = lon2 - lon1
-    a = np.sin(dlat/2.0)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2.0)**2
-    a = np.clip(a, 0.0, 1.0)
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
+    dlat = lat2 - lat1
+    # Haversine公式的核心计算。
+    a = sin(dlat / 2)**2 + cos(lat1) * cos(lat2) * sin(dlon / 2)**2
+    
+    # 避免浮点误差导致a略大于1，将其限制在1以内。
+    if a >= 1:
+        a = 1.0 - sys.float_info.epsilon
+    # 计算中心角。
+    c = 2 * atan2(sqrt(a), sqrt(1 - a))
+    # 返回球面距离。
     return c * EARTH_RADIUS_KM
 
-# ==========================================
-# 3. 主程序逻辑
-# ==========================================
+def gravity_model(demand_i, demand_j, distance_ij, normalization_factor):
+    """
+    根据重力模型计算两个节点之间的流量需求。
+
+    Args:
+        demand_i (float): 节点i的流量需求（权重）。
+        demand_j (float): 节点j的流量需求（权重）。
+        distance_ij (float): 节点i和节点j之间的距离。
+        normalization_factor (float): 标准化因子，用于调整流量大小。
+
+    Returns:
+        float: 节点i和节点j之间的流量需求。
+    """
+    # 避免除以零或非常小的距离
+    if distance_ij == 0: # 同一节点，流量为0
+        return 0.0
+    if normalization_factor == 0: # 避免除以零
+        return 0.0
+    
+    demand_ij = (demand_i * demand_j) / (distance_ij * normalization_factor)
+    return demand_ij
+
+def assign_ground_demand_to_satellites(current_time_data, regions_dict):
+    """
+    将地面区域的流量需求分配给最近的卫星。
+    返回每个卫星的流量权重字典。
+
+    Args:
+        current_time_data (pd.DataFrame): 当前时间步的卫星位置数据，包含 '纬度' 和 '经度' 列。
+        regions_dict (dict): 包含地理区域信息的字典。
+
+    Returns:
+        dict: 键为卫星ID（DataFrame内部索引），值为该卫星累积的流量权重。
+    """
+    satellite_weights_at_time = {}
+    
+    # 遍历每个地面区域
+    for region_key, region_value in regions_dict.items():
+        # 计算当前时间点所有卫星到该区域中心的距离
+        distances = current_time_data.apply(lambda row: haversine(
+            row['纬度'],
+            row['经度'],
+            region_value['lat_center'],
+            region_value['lon_center']
+        ), axis=1)
+        
+        # 找出最近的卫星
+        nearest_satellite_idx_in_df = distances.idxmin() # 获取DataFrame中的索引
+        
+        # 获取最近卫星的原始数据行，并提取其在当前time_data中的“节点编号”
+        # 注意：这里的“节点编号”是time_data的内部索引，不是Cons_Construction.py中的卫星名称
+        # 如果需要使用卫星名称，需要修改Cons_Construction.py输出或此处逻辑
+        satellite_id_for_weight = current_time_data.index.get_loc(nearest_satellite_idx_in_df)
+        
+        # 累加区域权重到最近的卫星
+        satellite_weights_at_time[satellite_id_for_weight] = \
+            satellite_weights_at_time.get(satellite_id_for_weight, 0) + region_value['weight']
+            
+    return satellite_weights_at_time
+
+def generate_traffic_matrix_for_time(time_step, satellite_positions, satellite_weights_at_time, total_nodes):
+    """
+    为单个时间步生成卫星间的流量矩阵。
+
+    Args:
+        time_step (int): 当前的时间步。
+        satellite_positions (dict): 键为卫星ID，值为 (纬度, 经度) 的字典。
+        satellite_weights_at_time (dict): 键为卫星ID，值为其流量权重的字典。
+        total_nodes (int): 卫星的总数量。
+
+    Returns:
+        pd.DataFrame: 表示卫星间流量的DataFrame（流量矩阵）。
+    """
+    # 初始化一个全零的流量矩阵。
+    traffic_matrix = [[0.0 for _ in range(total_nodes)] for _ in range(total_nodes)]
+    
+    # 预计算所有卫星对之间的距离
+    distance_matrix = {}
+    for i in range(total_nodes):
+        for j in range(i + 1, total_nodes): # 只计算上三角，避免重复
+            dist = haversine(satellite_positions[i][0], satellite_positions[i][1],
+                             satellite_positions[j][0], satellite_positions[j][1])
+            distance_matrix[(i, j)] = dist
+            distance_matrix[(j, i)] = dist # 对称存储
+            
+    # 使用重力模型填充流量矩阵
+    for i in range(total_nodes):
+        demand_i = satellite_weights_at_time.get(i, 0)
+        
+        # 计算标准化因子 (total_d)
+        # 这是重力模型中的一个关键部分，用于衡量卫星i与其他所有卫星的相对“吸引力”。
+        normalization_factor = 0.0
+        for k in range(total_nodes):
+            if k != i:
+                demand_k = satellite_weights_at_time.get(k, 0)
+                dist_ik = distance_matrix.get((i, k), 0) # 从预计算的距离矩阵中获取
+                if dist_ik > 0: # 避免除以零
+                    normalization_factor += (demand_k / dist_ik)
+
+        # 遍历所有其他卫星j，计算卫星i到卫星j的流量。
+        for j in range(total_nodes):
+            if i != j:
+                demand_j = satellite_weights_at_time.get(j, 0)
+                dist_ij = distance_matrix.get((i, j), 0) # 从预计算的距离矩阵中获取
+                # 调用重力模型计算流量，并填充到流量矩阵中。
+                traffic_matrix[i][j] = gravity_model(demand_i, demand_j, dist_ij, normalization_factor)
+                
+    return pd.DataFrame(traffic_matrix)
+
+# --- 主程序逻辑 ---
 def main():
-    print(">> 初始化区域矩阵...")
-    reg_lats, reg_lons, reg_weights = create_regions_arrays(WEIGHT_LIST, NUM_LAT_REGIONS, NUM_LON_REGIONS, LAT_RANGE, LON_RANGE)
-    
-    # 将区域经纬度转为行向量以备广播: [1, 288]
-    reg_lats = reg_lats.reshape(1, -1)
-    reg_lons = reg_lons.reshape(1, -1)
+    # 1. 初始化地面区域
+    # 根据预设的权重列表、区域数量和范围创建地理区域字典。
+    regions = create_regions(WEIGHT_LIST, NUM_LAT_REGIONS, NUM_LON_REGIONS, LAT_RANGE, LON_RANGE)
 
-    print(f">> 读取卫星轨迹文件: {SATELLITE_TRAJECTORY_CSV} ...")
+    # 2. 导入卫星轨迹数据
     try:
+        # 尝试从CSV文件读取卫星轨迹数据。
         all_satellite_data = pd.read_csv(SATELLITE_TRAJECTORY_CSV, encoding='utf-8')
-        # [非常重要]：修复 STK 浮点数精度误差，确保 groupby 能正确按整数分组
-        all_satellite_data['时间'] = all_satellite_data['时间'].round().astype(int)
     except FileNotFoundError:
-        print(f"错误: 未找到文件 '{SATELLITE_TRAJECTORY_CSV}'。")
+        # 如果文件未找到，打印错误信息并退出程序。
+        print(f"错误: 未找到卫星轨迹文件 '{SATELLITE_TRAJECTORY_CSV}'。请确保文件存在且路径正确。")
         sys.exit(1)
-
-    max_time_step = int(all_satellite_data['时间'].max())
-    total_sim_steps = max_time_step + 1
-    total_nodes = len(all_satellite_data[all_satellite_data['时间'] == 0])
     
-    print(f">> 卫星总数: {total_nodes} | 总时间帧数: {total_sim_steps}")
-    print(">> 🚀 开启 Numpy 矩阵加速计算...")
+    # 动态确定卫星总数
+    # 假设在第一个时间步，所有卫星都已出现
+    first_time_step_data = all_satellite_data[all_satellite_data['时间'] == all_satellite_data['时间'].min()]
+    total_nodes = len(first_time_step_data)
+    print(f"检测到卫星总数: {total_nodes}")
 
-    # 预先按时间分组，避免在循环中过滤 DataFrame (极大提升速度)
-    grouped_data = dict(tuple(all_satellite_data.groupby('时间')))
-    
-    # 建立一个大列表，暂存所有矩阵，最后一次性写入硬盘
-    all_traffic_matrices = []
+    # 确保CSV文件在开始写入前是空的，或者只包含一次header
+    # 如果是追加模式，第一次运行前需要手动删除文件或清空
+    # 这里为了简化，假设文件不存在或可以覆盖
+    # 如果需要保留历史数据，请调整为更复杂的逻辑
+    try:
+        # 以写入模式打开CSV文件，清空其内容（如果存在），不写入header和索引。
+        pd.DataFrame().to_csv(TRAFFIC_MATRIX_CSV, mode='w', header=False, index=False)
+    except Exception as e:
+        # 如果清空或创建文件失败，打印警告信息。
+        print(f"警告: 无法清空或创建流量矩阵文件 '{TRAFFIC_MATRIX_CSV}'。可能文件被占用或权限不足。错误: {e}")
 
-    for time_step in range(total_sim_steps):
-        if time_step % 100 == 0:
-            print(f"处理进度: {time_step}/{max_time_step}...")
-
-        current_time_data = grouped_data.get(time_step)
-        if current_time_data is None:
-            continue
-
-        # 提取当前帧所有卫星经纬度，转为列向量: [66, 1]
-        sat_lats = current_time_data['纬度'].values.reshape(-1, 1)
-        sat_lons = current_time_data['经度'].values.reshape(-1, 1)
-
-        # 步骤 1: 基于高斯天线波束的平滑覆盖 (Gaussian Footprint)
-        # ----------------------------------------------------
-        dist_sat_reg = haversine_vectorized(sat_lats, sat_lons, reg_lats, reg_lons)
+    # 3. 遍历每个时间步，计算卫星流量权重并生成流量矩阵
+    for time_step in range(1, TOTAL_SIM_TIME_STEPS):
+        print(f"\n处理时间步: {time_step}...")
+        # 筛选出当前时间步的卫星数据
+        current_time_data = all_satellite_data[all_satellite_data['时间'] == time_step]
         
-        # [核心蜕变]：不再使用绝对的最近邻！
-        # 假设卫星天线覆盖半径的标准差为 1200 km，使用高斯衰减平滑吸收地面流量
-        footprint_weights = np.exp(- (dist_sat_reg / 1200.0)**2)
-        
-        # 矩阵乘法：平滑聚合区域权重 [66, 288] @ [288] -> [66]
-        sat_weights = footprint_weights @ reg_weights
+        if not current_time_data.empty:
+            # 获取当前时间步的卫星位置 (以DataFrame索引作为ID)
+            satellite_positions = {}
+            for idx, row in current_time_data.iterrows():
+                # 使用DataFrame的内部索引作为卫星的临时ID
+                satellite_positions[current_time_data.index.get_loc(idx)] = (row['纬度'], row['经度'])
 
-        # ----------------------------------------------------
-        # 步骤 2: 生成全网重力流量矩阵
-        # ----------------------------------------------------
-        dist_sat_sat = haversine_vectorized(sat_lats, sat_lons, sat_lats.T, sat_lons.T)
-        np.fill_diagonal(dist_sat_sat, np.inf) 
-        
-        demand_k_matrix = np.tile(sat_weights, (total_nodes, 1)) 
-        norm_factors = np.sum(demand_k_matrix / dist_sat_sat, axis=1, keepdims=True) 
-        norm_factors[norm_factors == 0] = 1e-9 
+            # 将地面需求分配给卫星
+            satellite_weights_at_time = assign_ground_demand_to_satellites(current_time_data, regions)
+            
+            # 生成流量矩阵
+            traffic_df = generate_traffic_matrix_for_time(time_step, satellite_positions, satellite_weights_at_time, total_nodes)
+            
+            # 追加到CSV文件
+            traffic_df.to_csv(TRAFFIC_MATRIX_CSV, mode='a', header=False, index=False)
+            print(f"  - 流量矩阵已为时间步 {time_step} 保存。")
+        else:
+            print(f"  - 时间步 {time_step} 没有卫星数据，跳过。")
 
-        demand_i_matrix = sat_weights.reshape(-1, 1) 
-        demand_j_matrix = sat_weights.reshape(1, -1) 
-
-        base_traffic_matrix = (demand_i_matrix * demand_j_matrix) / (dist_sat_sat * norm_factors)
-        np.fill_diagonal(base_traffic_matrix, 0.0) 
-
-        # ----------------------------------------------------
-        # 步骤 3: 引入真实的微突发 (Pareto Burst Noise)
-        # ----------------------------------------------------
-        # 注入 5%~15% 的帕累托重尾噪声，制造真实的毛刺，供边缘节点捕获
-        burst_noise = np.random.pareto(3.0, size=base_traffic_matrix.shape) * 0.05
-        final_traffic_matrix = base_traffic_matrix * (1.0 + burst_noise)
-
-        all_traffic_matrices.append(final_traffic_matrix)
-
-    # ==========================================
-    # 4. 批量 I/O 写入 (一次性写入，绝不拖泥带水)
-    # ==========================================
-    print(">> 正在将全部数据批量写入硬盘，请稍候...")
-    # 垂直拼接所有矩阵为 [Time*66, 66]
-    final_output_array = np.vstack(all_traffic_matrices)
-    # 利用 np.savetxt 高速写入
-    np.savetxt(TRAFFIC_MATRIX_CSV, final_output_array, delimiter=',', fmt='%.6f')
-    
-    print(f'>> 🎉 运行完毕！所有时间步 ({total_sim_steps} 帧) 的流量矩阵已保存至 {TRAFFIC_MATRIX_CSV}')
+    print(f'\n所有时间步的流量矩阵已保存至 {TRAFFIC_MATRIX_CSV}')
 
 if __name__ == '__main__':
     main()

@@ -6,7 +6,7 @@ from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import uniform_filter1d
 
 class LEOSatelliteDataset(Dataset):     #大驼峰命名法，用于类的命名 #括号表示类的继承关系 #缩进替代大括号
-    def __init__(self, traffic_file, location_file, history_len=12, pred_len=1):    #__init__构造函数，创建对象时进行初始化
+    def __init__(self, traffic_file, location_file, history_len=10, pred_len=5):    #__init__构造函数，创建对象时进行初始化
         self.history_len = history_len      #将参数值保存为实例属性以便访问
         self.pred_len = pred_len
         self.num_nodes = 66

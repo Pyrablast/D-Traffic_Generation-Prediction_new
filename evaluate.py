@@ -11,16 +11,16 @@ from model import ST_GAGCN
 # ==========================================
 CONFIG = {
     'traffic_file': 'traffic_matrix(Iridium).csv',
-    'location_file': '经纬度(Iridium)new.csv',
-    'history_len': 12,   
-    'pred_len': 60,      
+    'location_file': '经纬度(Iridium).csv', # 确保名字和你用STK新生成的一致
+    'history_len': 10,   # 看过去 10 分钟
+    'pred_len': 5,       # 预测未来 5 分钟
     'hidden_dim': 64,
     'heads': 4,
     'device': torch.device('cuda' if torch.cuda.is_available() else 'cpu'),
     
-    'max_macro_cycle': 60, 
+    'max_macro_cycle': 15, # 【修改】从 60 改为 15。代表最多15分钟必须强制同步一次路由
     'trigger_margin': 1.1,          
-    'absolute_tolerance_mbps': 15.0 
+    'absolute_tolerance_mbps': 2.0 
 }
 
 # ==========================================
@@ -53,8 +53,10 @@ class SatelliteEdgeNode:
         
         real_pred_out = self._denormalize(pred_out)
         real_pred_in  = self._denormalize(pred_in)
-        real_actual_out = self._denormalize(actual_traffic_1s[0])
-        real_actual_in  = self._denormalize(actual_traffic_1s[1])
+        
+        # 【关键修复 1】强行将真实流量兜底为 0.0，杜绝浮点数下溢成为负数！
+        real_actual_out = max(0.0, self._denormalize(actual_traffic_1s[0]))
+        real_actual_in  = max(0.0, self._denormalize(actual_traffic_1s[1]))
         
         # 上限与下限计算
         upper_safe_out = real_pred_out * self.margin + self.abs_tol_mbps
@@ -64,10 +66,14 @@ class SatelliteEdgeNode:
         lower_safe_out = max(0.0, real_pred_out * lower_margin - self.abs_tol_mbps)
         lower_safe_in  = max(0.0, real_pred_in * lower_margin - self.abs_tol_mbps)
         
+        # 【关键修复 2】只有当下限大于 0 时（说明之前分配了带宽，现在空闲了），才允许触发 lower
+        out_lower_triggered = (lower_safe_out > 0.0) and (real_actual_out < lower_safe_out)
+        in_lower_triggered  = (lower_safe_in > 0.0) and (real_actual_in < lower_safe_in)
+        
         # 双边判定
         if real_actual_out > upper_safe_out or real_actual_in > upper_safe_in:
             return 'upper'
-        elif real_actual_out < lower_safe_out or real_actual_in < lower_safe_in:
+        elif out_lower_triggered or in_lower_triggered:
             return 'lower'
         else:
             return 'none'
@@ -213,7 +219,7 @@ def plot_satellite_dashboard(sat_idx, real_traffic, env_upper, env_lower, pure_p
         plt.axvline(x=t, color=color, linestyle=ls, linewidth=1.5, zorder=1)
         
     plt.title(f'Tube-based Event-Triggered Control on Satellite #{sat_idx}', fontsize=16, fontweight='bold')
-    plt.xlabel('Simulation Time (Seconds)', fontsize=14)
+    plt.xlabel('Simulation Time (Minutes)', fontsize=14)
     plt.ylabel('Traffic Volume (Mbps)', fontsize=14)
     plt.legend(loc='upper right', bbox_to_anchor=(1.0, 1.0), fontsize=10)
     plt.grid(True, linestyle='--', alpha=0.5)
@@ -227,7 +233,7 @@ def plot_satellite_dashboard(sat_idx, real_traffic, env_upper, env_lower, pure_p
     plt.plot(range(time_steps), sat_pred_real, label='ST-GAGCN Blind Prediction (60-Step)', marker='x', color='tab:orange', linewidth=1.5, markersize=6)
     
     plt.title(f'Real-time Prediction Tracking for Satellite #{sat_idx}', fontsize=16, fontweight='bold')
-    plt.xlabel('Simulation Time Steps (Seconds)', fontsize=14)
+    plt.xlabel('Simulation Time Steps (Minutes)', fontsize=14)
     plt.ylabel('Traffic Volume (Mbps)', fontsize=14)
     plt.legend(loc='upper right')
     plt.grid(True, linestyle='-', alpha=0.7)

@@ -13,9 +13,9 @@ from model import ST_GAGCN
 # ==========================================
 CONFIG = {
     'traffic_file': 'traffic_matrix(Iridium).csv',
-    'location_file': '经纬度(Iridium)new.csv',
-    'history_len': 12,   
-    'pred_len': 60,      
+    'location_file': '经纬度(Iridium).csv',
+    'history_len': 10,   
+    'pred_len': 5,      
     'batch_size': 16,    
     'epochs': 200,       
     'learning_rate': 0.001,

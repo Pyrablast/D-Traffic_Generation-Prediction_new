@@ -1,60 +1,59 @@
-import pandas as pd
+# --- START OF FILE visualize_burst.py (Synthetic Concept Version) ---
 import numpy as np
 import matplotlib.pyplot as plt
 
-def simulate_edge_node(csv_file, sat_idx=0, num_nodes=66):
-    print("正在加载 100ms 级高频流量矩阵...")
-    df = pd.read_csv(csv_file, header=None)
-    raw_data = df.values
+def generate_synthetic_micro_traffic(seconds=100, samples_per_sec=10):
+    """生成包含微突发的高频虚拟流量 (用于论证边缘节点预处理)"""
+    total_samples = seconds * samples_per_sec
+    time_x = np.linspace(0, seconds, total_samples)
     
-    total_steps = raw_data.shape[0] // num_nodes
-    raw_data = raw_data[:total_steps * num_nodes, :]
+    # 基础平滑流量 (模拟卫星过境时的宏观流量波峰)
+    base_traffic = 50 + 30 * np.sin(2 * np.pi * time_x / 100) 
     
-    # Reshape 为 [Time(100ms), Source, Dest]
-    traffic_tensor = raw_data.reshape(total_steps, num_nodes, num_nodes)
+    # 注入微突发 (Micro-bursts): 使用重尾分布模拟网络拥塞尖刺
+    burst_noise = np.random.pareto(a=2.5, size=total_samples) * 8.0
     
-    # 获取 0 号卫星在 100ms 级别的出流量总和
-    high_freq_traffic = np.sum(traffic_tensor[:, sat_idx, :], axis=1) # 长度为 6000
+    high_freq_traffic = base_traffic + burst_noise
+    return time_x, high_freq_traffic
+
+def plot_edge_node_concept():
+    print("正在生成虚拟的高频微突发数据，论证边缘节点截获能力...")
+    seconds_to_plot = 100
+    samples_per_sec = 10 # 100ms 采样率
     
-    # ==========================================
-    # 模拟边缘节点 (Satellite Edge) 的本地动作
-    # ==========================================
-    # 每 1 秒 (10 个 100ms 采样点) 作为一个宏观周期
-    macro_steps = total_steps // 10
+    # 生成高频数据
+    x_100ms, high_freq_traffic = generate_synthetic_micro_traffic(seconds_to_plot, samples_per_sec)
     
-    # 1. 你的方案: Max-pooling (捕获微突发)
-    max_pooled_traffic = np.max(high_freq_traffic[:macro_steps*10].reshape(macro_steps, 10), axis=1)
+    # 执行 Pooling
+    macro_steps = seconds_to_plot
+    reshaped_traffic = high_freq_traffic.reshape(macro_steps, samples_per_sec)
     
+    # 1. 我们的方案: Max-pooling (捕获微突发)
+    max_pooled_traffic = np.max(reshaped_traffic, axis=1)
     # 2. 传统方案: Average-pooling (平滑掉了突发)
-    avg_pooled_traffic = np.mean(high_freq_traffic[:macro_steps*10].reshape(macro_steps, 10), axis=1)
+    avg_pooled_traffic = np.mean(reshaped_traffic, axis=1)
     
-    # ==========================================
-    # 绘图展示对比
-    # ==========================================
-    # 为了看得清楚，我们只画前 100 秒 (1000 个 100ms 采样点)
-    plot_sec = min(100, macro_steps)
+    # 绘图
+    plt.figure(figsize=(14, 6))
     
-    plt.figure(figsize=(16, 6))
+    # 画底层 100ms 极高频原始数据
+    plt.plot(x_100ms, high_freq_traffic, color='lightgray', alpha=0.8, linewidth=1, label='Raw 100ms Micro-burst Traffic')
     
-    # 画底层 100ms 极高频原始数据 (灰色背景细线)
-    x_100ms = np.arange(plot_sec * 10) / 10.0  # 换算成秒
-    plt.plot(x_100ms, high_freq_traffic[:plot_sec*10], color='lightgray', alpha=0.8, linewidth=1, label='Raw 100ms Micro-traffic')
+    # 画传统 Average-pooling
+    x_1s = np.arange(macro_steps)
+    plt.step(x_1s, avg_pooled_traffic, where='post', color='seagreen', alpha=0.9, linewidth=2, linestyle='--', label='Traditional Avg-pooling (Misses Bursts)')
     
-    # 画传统 Average-pooling 的结果 (绿色线)
-    x_1s = np.arange(plot_sec)
-    plt.step(x_1s, avg_pooled_traffic[:plot_sec], where='post', color='green', alpha=0.7, linewidth=2, label='Traditional Avg-pooling (1s)')
+    # 画你的 Max-pooling
+    plt.step(x_1s, max_pooled_traffic, where='post', color='crimson', alpha=0.9, linewidth=2, label='Our Edge Max-pooling (Captures Bursts)')
     
-    # 画你的 Max-pooling 方案的结果 (红色线)
-    plt.step(x_1s, max_pooled_traffic[:plot_sec], where='post', color='red', linewidth=2, label='Your Max-pooling (1s)')
-    
-    plt.title(f"Edge Node Preprocessing: Max-pooling vs Avg-pooling (Satellite #{sat_idx})", fontsize=14)
-    plt.xlabel("Time (Seconds)", fontsize=12)
-    plt.ylabel("Traffic Volume", fontsize=12)
-    plt.grid(True, linestyle='--', alpha=0.5)
+    plt.title("Edge Node Preprocessing: Capturing Micro-bursts via Max-pooling", fontsize=16, fontweight='bold')
+    plt.xlabel("Local Processing Time", fontsize=14)
+    plt.ylabel("Traffic Volume (Mbps)", fontsize=14)
+    plt.grid(True, linestyle='--', alpha=0.4)
     plt.legend(fontsize=12, loc='upper left')
     plt.tight_layout()
-    plt.savefig('edge_node_pooling_comparison.png', dpi=300)
-    plt.show()
+    plt.savefig('edge_node_pooling_concept.png', dpi=300)
+    print(">> 理论论证图已生成：edge_node_pooling_concept.png (可以直接放进论文！)")
 
 if __name__ == "__main__":
-    simulate_edge_node("traffic_matrix(Iridium).csv", sat_idx=0)
+    plot_edge_node_concept()

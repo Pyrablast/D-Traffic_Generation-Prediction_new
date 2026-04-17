@@ -5,114 +5,106 @@ import math
 from torch.utils.data import Dataset, DataLoader
 from scipy.ndimage import uniform_filter1d
 
-class LEOSatelliteDataset(Dataset):     #大驼峰命名法，用于类的命名 #括号表示类的继承关系 #缩进替代大括号
-    def __init__(self, traffic_file, location_file, history_len=12, pred_len=1):    #__init__构造函数，创建对象时进行初始化
-        self.history_len = history_len      #将参数值保存为实例属性以便访问
+class LEOSatelliteDataset(Dataset):
+    def __init__(self, traffic_file, location_file, history_len=10, pred_len=5):
+        self.history_len = history_len
         self.pred_len = pred_len
         self.num_nodes = 66
         
         # ===========================
-        # 1. 读取并处理流量数据
+        # 1. 读取并处理流量数据 (适配原版，1步=1帧)
         # ===========================
-        # 读取 CSV，如果没有表头 header=None
+        # 原版流量矩阵直接生成 [Time * Nodes, Nodes] 的结构
         df_traffic = pd.read_csv(traffic_file, header=None)
         raw_traffic = df_traffic.values
         
-        # 100ms 级别的总时间步
-        high_freq_timesteps = raw_traffic.shape[0] // self.num_nodes
-        traffic_tensor_high_freq = raw_traffic.reshape(high_freq_timesteps, self.num_nodes, self.num_nodes)
+        # 直接计算总时间步
+        self.total_timesteps = raw_traffic.shape[0] // self.num_nodes
+        traffic_tensor = raw_traffic.reshape(self.total_timesteps, self.num_nodes, self.num_nodes)
         
-        # 每 10 个 100ms 为 1 秒
-        self.total_timesteps = high_freq_timesteps // 10 
-        
-        # 出流量 (Out-flow) 
-        out_flow_high = np.sum(traffic_tensor_high_freq, axis=2, keepdims=True) # [High_Time, Node, 1]
-        # 入流量 (In-flow) 
-        in_flow_high = np.sum(traffic_tensor_high_freq, axis=1, keepdims=True).transpose(0, 2, 1)
-        
-        # 执行 Max-pooling 
-        tmp = out_flow_high[:self.total_timesteps * 10].reshape(self.total_timesteps, 10, self.num_nodes, 1)
-        out_flow = np.mean(np.partition(tmp, -2, axis=1)[:, -2:, :, :], axis=1)
-        tmp = in_flow_high[:self.total_timesteps * 10].reshape(self.total_timesteps, 10, self.num_nodes, 1)
-        in_flow = np.mean(np.partition(tmp, -2, axis=1)[:, -2:, :, :], axis=1)
+        # 计算出流量和入流量
+        out_flow = np.sum(traffic_tensor, axis=2, keepdims=True) # [Time, Node, 1]
+        in_flow = np.sum(traffic_tensor, axis=1, keepdims=True).transpose(0, 2, 1) # [Time, Node, 1]
         
         # --- 归一化 ---
         self.flow_min = np.min(np.concatenate([out_flow, in_flow]))
         self.flow_max = np.max(np.concatenate([out_flow, in_flow]))
-        out_flow_norm = (out_flow - self.flow_min) / (self.flow_max - self.flow_min + 1e-5)
-        in_flow_norm = (in_flow - self.flow_min) / (self.flow_max - self.flow_min + 1e-5)
+        # 防止除零错误
+        denominator = self.flow_max - self.flow_min if self.flow_max > self.flow_min else 1.0
+        out_flow_norm = (out_flow - self.flow_min) / denominator
+        in_flow_norm = (in_flow - self.flow_min) / denominator
         
-        # --- 邻接矩阵 A ---
-        adj = np.zeros_like(traffic_tensor_high_freq)
+        # --- 构建邻接矩阵 A ---
+        adj = np.zeros_like(traffic_tensor)
         for t in range(self.total_timesteps):
             for i in range(self.num_nodes):
-                # 只有当该节点对外发送了有效流量时，才去寻找 top-4 邻居
-                if np.sum(traffic_tensor_high_freq[t, i, :]) > 1e-5:
-                    top4_neighbors = np.argsort(traffic_tensor_high_freq[t, i, :])[-4:]
+                # 依然采用业务流量Top-4驱动的动态邻接矩阵 (符合你模型的创新点)
+                if np.sum(traffic_tensor[t, i, :]) > 1e-5:
+                    top4_neighbors = np.argsort(traffic_tensor[t, i, :])[-4:]
                     adj[t, i, top4_neighbors] = 1.0
-                
-                # 无论如何，保留自环 (让卫星时刻记住自己的状态)
+                # 无论如何，保留自环
                 adj[t, i, i] = 1.0 
                 
         self.adj_matrices = adj.astype(np.float32)
         
         # ===========================
-        # 2. 读取并处理位置数据
+        # 2. 读取并处理位置数据 (适配原版经纬度.csv)
         # ===========================
         df_loc = pd.read_csv(location_file)
         
-        if '时间' in df_loc.columns and '当前节点' in df_loc.columns:
-            df_loc = df_loc.sort_values(by=['时间', '当前节点'])
+        # 【重要】提取卫星节点ID映射，为后续NS-3联调做准备
+        # 原版数据含有 "当前节点" 列（如 Iridium_1）
+        unique_nodes = df_loc['当前节点'].unique()
+        self.node_name_to_id = {name: idx for idx, name in enumerate(unique_nodes)}
         
-        # 此时 df_loc 长度是 100ms 级别的高频长度
-        high_freq_time = len(df_loc) // self.num_nodes
+        # 确保按时间和节点顺序排列，保证和流量矩阵严格对应
+        # 注意：这里假设时间列已经是数值/整数类型
+        df_loc = df_loc.sort_values(by=['时间', '当前节点'])
         
-        # Reshape 为 [时间帧, 卫星节点]
-        lats_matrix = df_loc['纬度'].values.reshape(high_freq_time, self.num_nodes)
-        lons_matrix = df_loc['经度'].values.reshape(high_freq_time, self.num_nodes)
+        # 直接 Reshape 为 [时间帧, 卫星节点]
+        # 如果 df_loc 的行数少于 total_timesteps * num_nodes，截断流量矩阵对齐
+        valid_timesteps = min(self.total_timesteps, len(df_loc) // self.num_nodes)
+        self.total_timesteps = valid_timesteps
         
-        # 按照每 10 帧 (1秒) 抽取一次，与流量时间步严格对齐
-        lats_matrix = lats_matrix[::10][:self.total_timesteps]
-        lons_matrix = lons_matrix[::10][:self.total_timesteps]
-        
-        # 展平回一维数组计算 Grid ID
-        lats = lats_matrix.flatten()
-        lons = lons_matrix.flatten()
+        lats_matrix = df_loc['纬度'].values[:self.total_timesteps * self.num_nodes].reshape(self.total_timesteps, self.num_nodes)
+        lons_matrix = df_loc['经度'].values[:self.total_timesteps * self.num_nodes].reshape(self.total_timesteps, self.num_nodes)
         
         # --- 计算 Grid ID ---
         grid_ids = []
-        for lat, lon in zip(lats, lons):    
+        for lat, lon in zip(lats_matrix.flatten(), lons_matrix.flatten()):    
             grid_ids.append(self._calculate_grid_id(lat, lon))  
             
-        # 重塑为 [Time, Node, 1]
         grid_ids = np.array(grid_ids).reshape(self.total_timesteps, self.num_nodes, 1)
         grid_ids_norm = grid_ids / 96.0
         
         # ===========================
         # 3. 特征融合
         # ===========================
-        # 现在维度应该是:
-        # out_flow_norm: (100, 66, 1)
-        # in_flow_norm:  (100, 66, 1)  
-        # grid_ids_norm: (100, 66, 1)
+        # 截断流量特征以与 valid_timesteps 对齐
+        out_flow_norm = out_flow_norm[:self.total_timesteps]
+        in_flow_norm = in_flow_norm[:self.total_timesteps]
+        self.adj_matrices = self.adj_matrices[:self.total_timesteps]
+        
         self.node_features = np.concatenate([out_flow_norm, in_flow_norm, grid_ids_norm], axis=2) 
         
-        # 用 5 秒的滑动平均滤掉纯随机尖刺，留下宏观趋势
-        smoothed_out = uniform_filter1d(out_flow_norm, size=5, axis=0)
-        smoothed_in = uniform_filter1d(in_flow_norm, size=5, axis=0)
+        # 因为现在时间步通常较长(如1分钟)，平滑窗口(size)建议缩小为3
+        smoothed_out = uniform_filter1d(out_flow_norm, size=3, axis=0)
+        smoothed_in = uniform_filter1d(in_flow_norm, size=3, axis=0)
         self.target_features = np.concatenate([smoothed_out, smoothed_in], axis=2)
         
-        # 转为 Tensor
         self.node_features = torch.FloatTensor(self.node_features)
-        self.target_features = torch.FloatTensor(self.target_features) # 新增平滑目标
+        self.target_features = torch.FloatTensor(self.target_features) 
         self.adj_matrices = torch.FloatTensor(self.adj_matrices)
         
-        # 准备索引
-        self.indices = []   #生成了一个从0到(总时间步-窗口总长)的连续整数列表用于索引
+        # 生成滑动窗口索引
+        self.indices = []   
         for i in range(self.total_timesteps - self.history_len - self.pred_len + 1):
             self.indices.append(i)
+            
+        print(f"Dataset 初始化完成！总有效时间步: {self.total_timesteps}, 可用样本数: {len(self.indices)}")
+        print(f"请牢记节点映射关系供NS-3使用: 0号节点为 {unique_nodes[0]}")
 
-    def _calculate_grid_id(self, lat, lon): #网格分区
+    def _calculate_grid_id(self, lat, lon): 
         row = math.floor((90 - lat) / 22.5)
         row = min(max(row, 0), 7)
         col = math.floor((180 + lon) / 30)
@@ -124,22 +116,21 @@ class LEOSatelliteDataset(Dataset):     #大驼峰命名法，用于类的命名
 
     def __getitem__(self, idx):
         t = self.indices[idx]
-        # 输入 X 依然是包含尖刺的原始真实特征 (让模型看到恶劣的现状)
         X = self.node_features[t : t + self.history_len, :, :]  
         A = self.adj_matrices[t + self.history_len - 1]         
-        
-        # 预测目标 Y 变成了“平滑后的趋势” (只取前两维 out/in flow)
         Y = self.target_features[t + self.history_len : t + self.history_len + self.pred_len, :, :2]  
         return X, A, Y
 
-# 测试部分
-if __name__ == "__main__":  #Python 的习惯用法，当这个脚本被直接运行时，才执行下面这些测试代码
-    try:                    #异常监测，尝试执行try中代码，出现错误后标记其特定类别比如Exception，
-        # 请确保文件名正确
-        dataset = LEOSatelliteDataset("traffic_matrix(Iridium).csv", "经纬度(Iridium)new.csv")
-        dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
-        data = next(iter(dataloader))
-        print("Success! Feature shape:", data[0].shape) # [Batch, 12, 66, 3]
-    except Exception as e:  #若出现Exception异常，跳转执行这里的代码，将异常对象赋值给e
+if __name__ == "__main__":
+    try:
+        # 注意替换为你原版STK生成的文件名
+        dataset = LEOSatelliteDataset("traffic_matrix(Iridium).csv", "经纬度(Iridium).csv")
+        if len(dataset) > 0:
+            dataloader = DataLoader(dataset, batch_size=2, shuffle=True)
+            data = next(iter(dataloader))
+            print("Success! Feature shape:", data[0].shape) 
+        else:
+            print("警告：可用样本数为 0！请增加 STK 的仿真总时长或减少 history_len / pred_len。")
+    except Exception as e:
         import traceback
         traceback.print_exc()
