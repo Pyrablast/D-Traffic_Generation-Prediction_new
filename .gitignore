@@ -1,0 +1,9 @@
+# 忽略所有数据集文件
+*.csv
+*.xlsx
+*.json
+
+# 忽略 Python 缓存和模型文件
+__pycache__/
+*.pth
+*.h5
